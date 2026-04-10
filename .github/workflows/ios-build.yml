@@ -1,0 +1,139 @@
+name: iOS Build, Screenshot and Deploy
+
+on:
+  workflow_dispatch: # Запуск вручную через вкладку Actions
+
+jobs:
+  build-and-deploy:
+    runs-on: macos-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download and Unzip Project
+        run: |
+          # Скачиваем архив и контрольную сумму
+          wget http://46.254.17.191/iosp/ios-push.zip
+          wget http://46.254.17.191/iosp/ios-push.zip.sha256
+          
+          # Проверяем контрольную сумму SHA256
+          echo "Verifying SHA256 checksum..."
+          shasum -a 256 -c ios-push.zip.sha256
+          
+          # Распаковка
+          unzip ios-push.zip -d .
+          # Проверка структуры (должна быть папка ios/App)
+          ls -R ios/App
+
+      - name: Install CocoaPods Dependencies
+        run: |
+          cd ios/App
+          # Чистая переустановка подов
+          pod deintegrate
+          pod install
+
+      - name: Setup Apple Certificates
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          printf "%s" "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+          printf "%s" "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o $PP_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
+
+      - name: Run Simulator & Take Screenshot
+        run: |
+          # Конфигурация симулятора
+          SIM_NAME="iPhone 15"
+          DEST="platform=iOS Simulator,name=$SIM_NAME"
+
+          # 1. Сборка под симулятор (Debug)
+          xcodebuild build \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -sdk iphonesimulator \
+            -destination "$DEST" \
+            -configuration Debug \
+            -derivedDataPath build_sim
+
+          # 2. Запуск симулятора
+          DEVICE_UUID=$(xcrun simctl list devices | grep "$SIM_NAME" | grep -v "unavailable" | head -1 | awk -F '[()]' '{print $2}')
+          xcrun simctl boot $DEVICE_UUID || true
+          xcrun simctl bootstatus $DEVICE_UUID
+
+          # 3. Установка и запуск приложения
+          APP_PATH=$(find build_sim -name "*.app" | head -1)
+          xcrun simctl install $DEVICE_UUID "$APP_PATH"
+
+          BUNDLE_ID=$(defaults read "$(pwd)/$APP_PATH/Info.plist" CFBundleIdentifier)
+          xcrun simctl launch $DEVICE_UUID "$BUNDLE_ID"
+
+          # Ожидание 30 секунд для загрузки контента
+          sleep 30
+
+          # 4. Скриншот
+          mkdir -p screenshots
+          xcrun simctl io $DEVICE_UUID screenshot screenshots/app_preview.png
+          xcrun simctl shutdown $DEVICE_UUID
+
+      - name: Upload Screenshot Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-preview-screenshot
+          path: screenshots/app_preview.png
+          retention-days: 5
+
+      - name: Build Archive (Release)
+        run: |
+          xcodebuild archive \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -archivePath ios/App/App.xcarchive \
+            -configuration Release \
+            -allowProvisioningUpdates
+
+      - name: Export IPA
+        env:
+          EXPORT_OPTIONS_PLIST: ${{ secrets.EXPORT_OPTIONS_PLIST }}
+        run: |
+          EXPORT_OPTS_PATH=$RUNNER_TEMP/ExportOptions.plist
+          printf "%s" "$EXPORT_OPTIONS_PLIST" > $EXPORT_OPTS_PATH
+
+          xcodebuild -exportArchive \
+            -archivePath ios/App/App.xcarchive \
+            -exportPath ios/App/output \
+            -exportOptionsPlist $EXPORT_OPTS_PATH \
+            -allowProvisioningUpdates
+
+      - name: Upload to App Store Connect
+        env:
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          API_KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_API_KEY_CONTENT }}
+        run: |
+          mkdir -p ~/.private_keys
+          # Записываем контент ключа в файл без вывода в консоль
+          printf "%s" "$API_KEY_CONTENT" > ~/.private_keys/AuthKey_$API_KEY_ID.p8
+
+          xcrun altool --upload-app \
+            --type ios \
+            --file ios/App/output/App.ipa \
+            --apiKey "$API_KEY_ID" \
+            --apiIssuer "$API_ISSUER_ID"
